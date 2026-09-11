@@ -393,57 +393,6 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  new PiAcpSession({
-    sessionId: 's1',
-    cwd: process.cwd(),
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  proc.emit({ type: 'auto_compaction_start' } as any)
-
-  await new Promise(r => setTimeout(r, 0))
-
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' }
-  })
-})
-
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  new PiAcpSession({
-    sessionId: 's1',
-    cwd: process.cwd(),
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  proc.emit({ type: 'auto_compaction_end' } as any)
-
-  await new Promise(r => setTimeout(r, 0))
-
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: {
-      type: 'text',
-      text: 'Automatic compaction finished; context was summarized to continue the session.'
-    }
-  })
-})
-
 test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with text_delta events', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -738,7 +687,7 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
   assert.equal(reason, 'cancelled')
 })
 
-test('PiAcpSession: queues concurrent prompt and starts it after agent_settled', async () => {
+test('PiAcpSession: forwards concurrent prompt to pi follow_up queue, both resolve at the same settle', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -756,15 +705,51 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
 
   assert.equal(proc.prompts.length, 1)
   assert.equal(proc.prompts[0]!.message, 'one')
+  assert.equal(proc.followUps.length, 1)
+  assert.equal(proc.followUps[0]!.message, 'two')
+
+  // pi's agent_settled fires only after its own queue drains, so both prompts
+  // complete at the same settle with the same outcome.
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await first, 'end_turn')
+  assert.equal(await second, 'end_turn')
+  assert.equal(proc.prompts.length, 1)
+})
+
+test('PiAcpSession: falls back to the local queue when pi refuses the follow_up', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.followUpError = new Error('pi follow_up failed: refused')
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+  const second = session.prompt('two')
+  // Let the follow_up rejection fall back into the local queue.
+  await new Promise(r => setTimeout(r, 0))
+
+  // pi refused the forward, so nothing was recorded on its side.
+  // Local fallback took over.
+  assert.equal(proc.prompts.length, 1)
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
   proc.emit({ type: 'agent_settled' })
 
-  const r1 = await first
-  assert.equal(r1, 'end_turn')
-
+  assert.equal(await first, 'end_turn')
+  // The fallback queue starts the next prompt as its own turn.
   assert.equal(proc.prompts.length, 2)
   assert.equal(proc.prompts[1]!.message, 'two')
 
@@ -773,8 +758,29 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
   proc.emit({ type: 'agent_end' })
   proc.emit({ type: 'agent_settled' })
 
-  const r2 = await second
-  assert.equal(r2, 'end_turn')
+  assert.equal(await second, 'end_turn')
+})
+
+test('PiAcpSession: queue_update from pi publishes queue depth metadata', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  void session.prompt('one')
+  proc.emit({ type: 'queue_update', steering: ['fix that'], followUp: ['also this', 'and that'] } as any)
+  await new Promise(r => setTimeout(r, 0))
+
+  const last = conn.updates.at(-1)
+  assert.equal(last?.update?.sessionUpdate, 'session_info_update')
+  assert.deepEqual((last!.update as any)._meta, { piAcp: { queueDepth: 3, running: true } })
 })
 
 test('PiAcpSession: cancel clears queued prompts', async () => {

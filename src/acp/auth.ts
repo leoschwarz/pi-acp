@@ -1,4 +1,7 @@
 import type { AuthMethod } from '@agentclientprotocol/sdk'
+import { existsSync, renameSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { getAgentDir } from './pi-settings.js'
 
 export const PI_SETUP_METHOD_ID = 'pi_terminal_login'
 
@@ -39,6 +42,23 @@ export function getAuthMethods(opts?: { supportsTerminalAuthMeta?: boolean }): A
   }
 
   return [method as AuthMethod]
+}
+
+/**
+ * Clears all stored pi credentials (`<agentDir>/auth.json`), the disk equivalent of pi's
+ * `/logout`. auth.json is purely a credential map, so an empty object is the logged-out state.
+ *
+ * pi guards the file with proper-lockfile; we don't link it, so we settle for an atomic
+ * replace (temp file + rename). A login racing this in a concurrent pi process can win;
+ * that race is inherent to out-of-band credential clearing.
+ */
+export function clearPiCredentials(): void {
+  const authPath = join(getAgentDir(), 'auth.json')
+  if (!existsSync(authPath)) return
+
+  const tmpPath = `${authPath}.tmp-${process.pid}-${Date.now()}`
+  writeFileSync(tmpPath, '{}\n', { encoding: 'utf-8', mode: 0o600 })
+  renameSync(tmpPath, authPath)
 }
 
 function terminalAuthLaunchSpec(): { command: string; args: string[] } {

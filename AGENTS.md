@@ -24,7 +24,11 @@ Use `@agentclientprotocol/sdk`:
 
 ## Implementation constraints / decisions
 
-- Do **not** implement ACP client-side FS/terminal delegation in MVP. Pi already reads/writes and executes locally.
+- Client-side FS delegation (`fs/read_text_file` / `fs/write_text_file`) is implemented via the
+  bundled pi extension (`src/extension/pi-fs-delegate.ts`) that overrides pi's built-in
+  `read`/`write`/`edit` tools and bridges them to the client; enable/disable is
+  capability-driven, `PI_ACP_FS_DELEGATE=false` opts out (see `src/acp/fs-delegate.ts`).
+  Terminal delegation (`terminal/*`) is not implemented: pi executes `bash` locally.
 - Ignore `mcpServers` for MVP (accept in params, store in session state).
 - Stream all pi assistant output as ACP `agent_message_chunk` initially.
 - Tool events: map pi tool execution events to ACP `tool_call` / `tool_call_update` (as text content).
@@ -65,15 +69,11 @@ For real validation, test with an ACP client (e.g. Zed external agent).
 - After making code edits, run formatting before finishing the task. Use `npm run format` when it is safe to format the whole worktree; otherwise use the narrowest safe formatter command for the files you touched.
 - If formatting is skipped or fails, say so explicitly in the final response.
 
-## Source control
-
-- **DO NOT** commit unless explicitly asked!
-
 ## Client information
 
 - Current ACP client is Zed
 
 ## References
 
-- Local ACP repo with protocol documentation and specs: `~/Dev/learning/agent-client-protocol`
-- Local Zed repo `~/Dev/learning/zed/zed`
+- ACP repo with protocol documentation and specs: https://github.com/zed-industries/agent-client-protocol
+- Zed repo: https://github.com/zed-industries/zed

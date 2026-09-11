@@ -41,6 +41,9 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
             ]
           }
         },
+        async getAvailableThinkingLevels() {
+          return ['off', 'low', 'high', 'xhigh', 'max']
+        },
         async getState() {
           return {
             thinkingLevel: 'high',
@@ -81,14 +84,57 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         currentValue: 'high',
         options: [
           { value: 'off', name: 'Thinking: off', description: null },
-          { value: 'minimal', name: 'Thinking: minimal', description: null },
           { value: 'low', name: 'Thinking: low', description: null },
-          { value: 'medium', name: 'Thinking: medium', description: null },
           { value: 'high', name: 'Thinking: high', description: null },
-          { value: 'xhigh', name: 'Thinking: xhigh', description: null }
+          { value: 'xhigh', name: 'Thinking: xhigh', description: null },
+          { value: 'max', name: 'Thinking: max', description: null }
         ]
       }
     ])
+  } finally {
+    ;(globalThis as any).setTimeout = realSetTimeout
+  }
+})
+
+test('PiAcpAgent: newSession falls back to the pi default level list when the RPC fails', async () => {
+  const realSetTimeout = globalThis.setTimeout
+  ;(globalThis as any).setTimeout = () => 0 as any
+
+  try {
+    const conn = new FakeAgentSideConnection()
+    const session = {
+      sessionId: 's1',
+      cwd: process.cwd(),
+      proc: {
+        async getAvailableModels() {
+          return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
+        },
+        async getAvailableThinkingLevels() {
+          throw new Error('rpc unavailable')
+        },
+        async getState() {
+          return {
+            thinkingLevel: 'high',
+            model: { provider: 'test', id: 'alpha' }
+          }
+        }
+      },
+      setStartupInfo() {},
+      sendStartupInfoIfPending() {}
+    }
+
+    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    ;(agent as any).sessions = new FakeSessions(session) as any
+
+    const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+
+    const thoughtLevel = result.configOptions.find(option => option.id === 'thought_level') as
+      | { options: Array<{ value: string }> }
+      | undefined
+    assert.deepEqual(
+      thoughtLevel?.options.map(option => option.value),
+      ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    )
   } finally {
     ;(globalThis as any).setTimeout = realSetTimeout
   }
@@ -163,6 +209,9 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
           models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }]
         }
       },
+      async getAvailableThinkingLevels() {
+        return ['off', 'low', 'high', 'xhigh', 'max']
+      },
       async getState() {
         return state
       },
@@ -200,4 +249,83 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
       }
     }
   ])
+})
+
+test('PiAcpAgent: setSessionConfigOption accepts levels pi advertises beyond the legacy list', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state = {
+    thinkingLevel: 'high',
+    model: { provider: 'test', id: 'alpha' }
+  }
+  const thinkingLevels: string[] = []
+
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
+      },
+      async getAvailableThinkingLevels() {
+        return ['off', 'low', 'high', 'max']
+      },
+      async getState() {
+        return state
+      },
+      async setThinkingLevel(level: string) {
+        thinkingLevels.push(level)
+        state.thinkingLevel = level
+      }
+    }
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await agent.setSessionConfigOption({
+    sessionId: 's1',
+    configId: 'thought_level',
+    value: 'max'
+  } as any)
+
+  assert.deepEqual(thinkingLevels, ['max'])
+  assert.equal(state.thinkingLevel, 'max')
+})
+
+test('PiAcpAgent: setSessionConfigOption rejects levels pi does not advertise', async () => {
+  const conn = new FakeAgentSideConnection()
+  const thinkingLevels: string[] = []
+
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
+      },
+      async getAvailableThinkingLevels() {
+        return ['off', 'low', 'high']
+      },
+      async getState() {
+        return { thinkingLevel: 'high', model: { provider: 'test', id: 'alpha' } }
+      },
+      async setThinkingLevel(level: string) {
+        thinkingLevels.push(level)
+      }
+    }
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await assert.rejects(
+    () =>
+      agent.setSessionConfigOption({
+        sessionId: 's1',
+        configId: 'thought_level',
+        value: 'xhigh'
+      } as any),
+    /invalid params/i
+  )
+  assert.deepEqual(thinkingLevels, [])
 })

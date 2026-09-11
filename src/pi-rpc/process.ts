@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { FsDelegateServer, fsDelegateSpawnEnv } from './delegate-server.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -29,13 +30,17 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
+  | { type: 'follow_up'; id?: string; message: string; images?: unknown[] }
+  | { type: 'clear_queue'; id?: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'get_available_thinking_levels'; id?: string }
+  | { type: 'set_thinking_level'; id?: string; level: string }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -47,6 +52,7 @@ type PiRpcCommand =
   | { type: 'set_session_name'; id?: string; name: string }
   | { type: 'export_html'; id?: string; outputPath?: string }
   | { type: 'switch_session'; id?: string; sessionPath: string }
+  | { type: 'clone'; id?: string }
   // Messages
   | { type: 'get_messages'; id?: string }
   // Commands
@@ -74,6 +80,10 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** If set, spawn pi with the bundled fs-delegate extension (client-side fs delegation). */
+  fsDelegateExtensionPath?: string
+  /** Client fs caps for the extension's per-tool gating (which built-ins to override). */
+  fsDelegateCaps?: { read: boolean; write: boolean }
 }
 
 export class PiRpcProcess {
@@ -81,6 +91,8 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  private exitHandlers: Array<() => void> = []
+  private fsDelegate: FsDelegateServer | null = null
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
@@ -118,6 +130,14 @@ export class PiRpcProcess {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      this.disposeFsDelegate()
+      for (const h of this.exitHandlers.splice(0)) {
+        try {
+          h()
+        } catch {
+          // ignore
+        }
+      }
     })
 
     child.on('error', err => {
@@ -137,10 +157,31 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
+    let fsDelegate: FsDelegateServer | null = null
+    if (params.fsDelegateExtensionPath) {
+      // Created before spawn so its socket path/token can reach the subprocess
+      // via env; on failure, fall back to spawning without delegation.
+      try {
+        fsDelegate = await FsDelegateServer.create()
+      } catch {
+        fsDelegate = null
+      }
+    }
+    if (fsDelegate) args.push('-e', params.fsDelegateExtensionPath!)
+
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(fsDelegate
+          ? fsDelegateSpawnEnv(
+              params.fsDelegateCaps ?? { read: true, write: true },
+              fsDelegate.socketPath,
+              fsDelegate.token
+            )
+          : {})
+      },
       shell: shouldUseShellForPiCommand(cmd)
     })
 
@@ -185,6 +226,7 @@ export class PiRpcProcess {
     })
 
     const proc = new PiRpcProcess(child)
+    proc.fsDelegate = fsDelegate
 
     // Best-effort handshake.
     // Important: pi may emit a get_state response pointing at a sessionFile in a directory
@@ -212,8 +254,27 @@ export class PiRpcProcess {
     }
   }
 
+  /** Subscribe to subprocess exit (fires once; used to release fs-delegate resources). */
+  onExit(handler: () => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /** The fs-delegate socket server for this subprocess, when delegation is active. */
+  getFsDelegate(): FsDelegateServer | null {
+    return this.fsDelegate
+  }
+
+  private disposeFsDelegate(): void {
+    this.fsDelegate?.dispose()
+    this.fsDelegate = null
+  }
+
   dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
     if (this.child.killed) return
+    this.disposeFsDelegate()
     try {
       this.child.kill(signal as any)
     } catch {
@@ -233,6 +294,29 @@ export class PiRpcProcess {
   async prompt(message: string, images: unknown[] = []): Promise<void> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /** Inject a mid-turn message: pi delivers it after the current assistant turn. */
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'steer', message, images })
+    if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /** Queue a message to run after the current turn completes. */
+  async followUp(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'follow_up', message, images })
+    if (!res.success) throw new Error(`pi follow_up failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /** Drop everything pi has queued; returns what was cleared. */
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    const res = await this.request({ type: 'clear_queue' })
+    if (!res.success) throw new Error(`pi clear_queue failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = (res.data ?? {}) as { steering?: string[]; followUp?: string[] }
+    return {
+      steering: Array.isArray(data.steering) ? data.steering : [],
+      followUp: Array.isArray(data.followUp) ? data.followUp : []
+    }
   }
 
   async abort(): Promise<void> {
@@ -258,7 +342,20 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  /**
+   * Levels pi currently supports for the active model (mirrors THINKING_LEVEL_OPTIONS
+   * when no model is set). Pi is the source of truth; do not mirror the list here.
+   */
+  async getAvailableThinkingLevels(): Promise<string[]> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success)
+      throw new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const levels = (res.data as { levels?: unknown } | undefined)?.levels
+    if (!Array.isArray(levels)) return []
+    return levels.filter((l): l is string => typeof l === 'string')
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
@@ -305,6 +402,18 @@ export class PiRpcProcess {
   async switchSession(sessionPath: string): Promise<void> {
     const res = await this.request({ type: 'switch_session', sessionPath })
     if (!res.success) throw new Error(`pi switch_session failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /**
+   * Fork the current pi session at its leaf into a new branched session.
+   * Note: pi rebinds THIS subprocess to the new session (no second process is spawned);
+   * afterwards getState() reports the new sessionId/sessionFile.
+   */
+  async cloneSession(): Promise<{ cancelled: boolean }> {
+    const res = await this.request({ type: 'clone' })
+    if (!res.success) throw new Error(`pi clone failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = res.data as { cancelled?: unknown } | undefined
+    return { cancelled: data?.cancelled === true }
   }
 
   async getMessages(): Promise<unknown> {

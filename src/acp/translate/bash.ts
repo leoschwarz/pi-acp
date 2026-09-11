@@ -24,6 +24,18 @@ export function isBashTool(toolName: string): boolean {
   return toolName.toLowerCase() === 'bash'
 }
 
+/**
+ * Zed renders bash tool calls as display-only terminals from ACP `terminal` content plus
+ * `terminal_info`/`terminal_output`/`terminal_exit` `_meta` — a convention whose terminal
+ * IDs never went through `terminal/create`. Clients advertising real ACP terminal support
+ * expect `terminal/create` semantics and would break on these fake IDs, so the hack must
+ * only be used for clients that don't advertise `terminal: true`.
+ */
+export function shouldUseZedTerminalFallback(clientCapabilities: unknown): boolean {
+  const terminal = (clientCapabilities as { terminal?: unknown } | null | undefined)?.terminal
+  return terminal !== true
+}
+
 export function bashCommand(value: unknown): string | undefined {
   const record = value as BashCommandRecord | null | undefined
   const command =
